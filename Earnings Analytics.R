@@ -1,106 +1,21 @@
-library(tidyquant)
-library(tidyverse)
-library(rvest)
-library(scales)
-library(birk)
+# Libraries ----
+if (!require("tidyquant")) install.packages("tidyquant"); library(tidyquant)
+if (!require("tidyverse")) install.packages("tidyverse"); library(tidyverse)
+if (!require("rvest")) install.packages("rvest"); library(rvest)
+if (!require("scales")) install.packages("scales"); library(scales)
+if (!require("birk")) install.packages("birk"); library(birk)
+if (!require("janitor")) install.packages("janitor"); library(janitor)
+if (!require("jsonlite")) install.packages("jsonlite"); library(jsonlite)
+if (!require("htmlTable")) install.packages("htmlTable"); library(htmlTable)
 
 # Block Warnings
 options(warn=-1)
 
 # Local Variables
 ticker               <- "AAPL"
-earnings_date        <- "2023-01-26" 
+earnings_date        <- "2024-03-28" %>% as.Date()
 Days_Before_Earnings <- 2
 Days_After_Earnings  <- 5
-
-# External Function
-html_table_fix <- function(x, header = NA, trim = TRUE, fill = FALSE, dec = ".") {
-  
-  stopifnot(html_name(x) == "table")
-  
-  # Throw error if any rowspan/colspan present
-  rows <- html_nodes(x, "tr")
-  n <- length(rows)
-  cells <- lapply(rows, "html_nodes", xpath = ".//td|.//th")
-  
-  ncols <- lapply(cells, html_attr, "colspan", default = "1")
-  # Replace empty values of colspan with "1"
-  ncols <- lapply(ncols, function(x) {x[x==""] <- "1"; x})
-  ncols <- lapply(ncols, as.integer)
-  nrows <- lapply(cells, html_attr, "rowspan", default = "1")
-  nrows <- lapply(nrows, as.integer)
-  
-  p <- unique(vapply(ncols, sum, integer(1)))
-  maxp <- max(p)
-  
-  if (length(p) > 1 & maxp * n != sum(unlist(nrows)) &
-      maxp * n != sum(unlist(ncols))) {
-    # then malformed table is not parsable by smart filling solution
-    if (!fill) { # fill must then be specified to allow filling with NAs
-      stop("Table has inconsistent number of columns. ",
-           "Do you want fill = TRUE?", call. = FALSE)
-    }
-  }
-  
-  values <- lapply(cells, html_text, trim = trim)
-  out <- matrix(NA_character_, nrow = n, ncol = maxp)
-  
-  # fill colspans right with repetition
-  for (i in seq_len(n)) {
-    row <- values[[i]]
-    ncol <- ncols[[i]]
-    col <- 1
-    for (j in seq_len(length(ncol))) {
-      out[i, col:(col+ncol[j]-1)] <- row[[j]]
-      col <- col + ncol[j]
-    }
-  }
-  
-  # fill rowspans down with repetition
-  for (i in seq_len(maxp)) {
-    for (j in seq_len(n)) {
-      rowspan <- nrows[[j]][i]; colspan <- ncols[[j]][i]
-      if (!is.na(rowspan) & (rowspan > 1)) {
-        if (!is.na(colspan) & (colspan > 1)) {
-          # special case of colspan and rowspan in same cell
-          nrows[[j]] <- c(utils::head(nrows[[j]], i),
-                          rep(rowspan, colspan-1),
-                          utils::tail(nrows[[j]], length(rowspan)-(i+1)))
-          rowspan <- nrows[[j]][i]
-        }
-        for (k in seq_len(rowspan - 1)) {
-          l <- utils::head(out[j+k, ], i-1)
-          r <- utils::tail(out[j+k, ], maxp-i+1)
-          out[j + k, ] <- utils::head(c(l, out[j, i], r), maxp)
-        }
-      }
-    }
-  }
-  
-  if (is.na(header)) {
-    header <- all(html_name(cells[[1]]) == "th")
-  }
-  if (header) {
-    col_names <- out[1, , drop = FALSE]
-    out <- out[-1, , drop = FALSE]
-  } else {
-    col_names <- paste0("X", seq_len(ncol(out)))
-  }
-  
-  # Convert matrix to list to data frame
-  df <- lapply(seq_len(maxp), function(i) {
-    utils::type.convert(out[, i], as.is = TRUE, dec = dec)
-  })
-  names(df) <- col_names
-  class(df) <- "data.frame"
-  attr(df, "row.names") <- .set_row_names(length(df[[1]]))
-  
-  if (length(unique(col_names)) < length(col_names)) {
-    warning('At least two columns have the same name')
-  }
-  
-  df
-} 
 
 getYahooEarnings <- function(ticker){
   
@@ -108,11 +23,12 @@ getYahooEarnings <- function(ticker){
   db_Earnings <- str_glue("https://finance.yahoo.com/calendar/earnings?failsafe=1&ynet=0&_device=desktop&device=desktop&symbol={ticker}") %>%
     rvest::read_html() %>%
     rvest::html_nodes("table") %>%
-    html_table_fix() %>%
-    dplyr::mutate(Month           = substr(`Earnings Date`, 1, 3),
-                  Day             = substr(`Earnings Date`, 5, 6),
-                  Year            = substr(`Earnings Date`, 8, 12),
-                  PM_AH           = substr(`Earnings Date`, 18, 19))
+    html_table(fill = TRUE) %>%
+    pluck(1) %>%
+    dplyr::mutate(Month = substr(`Earnings Date`, 1, 3),
+                  Day   = substr(`Earnings Date`, 5, 6),
+                  Year  = substr(`Earnings Date`, 8, 12),
+                  PM_AH = substr(`Earnings Date`, 18, 19))
   
   # Fixing some formats
   db_Earnings <- db_Earnings %>%
@@ -143,66 +59,47 @@ getYahooEarnings <- function(ticker){
 }
 
 # Getting the data and removing future earnings dates
-db_Yahoo <- getYahooEarnings(ticker)
+db_Yahoo_Earnings <- getYahooEarnings(ticker)
 
 # Getting expected move
-db_option <- getOptionChain(ticker, src = "yahoo", Exp = str_glue("{lubridate::year(Sys.Date())}/{lubridate::year(Sys.Date()) + 1}")) %>%
-  unlist(recursive = FALSE) %>%
-  enframe() %>%
-  unnest(cols = c(value))
+db_option <- str_glue("https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json") %>%
+  read_json(simplifyVector = TRUE) 
 
-  # Extracting the type of Option
-  opt_type <- c()
-  for(i in 1:nrow(db_option)){ # i <- 1
-    
-    # Selecting the name column
-    name_tag <- db_option$name[i]
-    
-    # Getting the length of that name
-    name_length <- nchar(name_tag)
-    
-    # Getting the option type
-    opt_type <- c(opt_type, substr(name_tag, 14, name_length))
-  }
-  
-  # Adding the Option Type
-  db_option_enhanced <- db_option %>%
-    dplyr::mutate(type = opt_type)
-  
-# Getting the closet Expiration date (option) from the Earnings release
-date_index <- which.closest(db_option_enhanced$Expiration %>% as.Date() %>% unique(), earnings_date %>% as.Date())
+db_option_cboe <- db_option[["data"]][["options"]] %>% 
+  as.data.frame() %>%
+  dplyr::mutate(Spot_Price   = db_option[["data"]][["current_price"]],
+                expiry       = option %>% str_sub(-15, -10) %>% as.Date(format = "%y%m%d"),
+                opt_type     = option %>% str_sub(-9, -9),
+                strike       = ((option %>% str_sub(-8, length(option))) %>% as.numeric())/1000,
+                days2Exp     = as.Date(expiry) - Sys.Date(),
+                Mid_price    = round((bid + ask)/2, 2),
+                Time_Process = Sys.time(),
+                Flag_Expiry  = case_when(as.Date(expiry) == as.Date(earnings_date) ~ "Here",
+                                         TRUE ~ "No"),
+                Flag_Strike  = case_when(strike < db_option[["data"]][["current_price"]] ~ "OTM",
+                                         TRUE ~ "ITM")) %>%
+  dplyr::filter(Flag_Expiry == "Here" & Flag_Strike == "ITM") %>%
+  dplyr::slice(1:2)
 
-closet_option_expiration_date <- db_option_enhanced$Expiration %>% 
-  unique() %>%
-  pluck(date_index)
-  
-# Calculating the Expected Move
-  # Calls
-  bid_price_ATM_Calls <- db_option_enhanced %>%
-    dplyr::filter(Expiration == closet_option_expiration_date & type == "calls") %>%
-    dplyr::mutate(ATM = ifelse(Strike < getQuote(ticker)$Last, "ITM", "OTM")) %>%
-    dplyr::filter(ATM == "OTM") %>%
-    head(n = 1) %>%
-    dplyr::select(Bid) %>%
-    pull(1)
-    
-  # Puts
-  bid_price_ATM_Puts <- db_option_enhanced %>%
-    dplyr::filter(Expiration == closet_option_expiration_date & type == "puts") %>%
-    dplyr::mutate(ATM = ifelse(Strike < getQuote(ticker)$Last, "ITM", "OTM")) %>%
-    dplyr::filter(ATM == "OTM") %>%
-    head(n = 1) %>%
-    dplyr::select(Bid) %>%
-    pull(1)
+# Extracting the Prices for Call and Puts
+bid_price_ATM_Calls <- db_option_cboe %>%
+  dplyr::filter(opt_type == "C") %>%
+  dplyr::select(bid) %>%
+  pull(1)
 
-  # Expected Move (In Dollars)
-  Expected_Move_dll <- (bid_price_ATM_Calls + bid_price_ATM_Puts)*0.84
-  
-  # Expected Move (In %)
-  Expected_Move_pct <- (bid_price_ATM_Calls + bid_price_ATM_Puts)*0.84/getQuote(ticker)$Last
+bid_price_ATM_Puts <- db_option_cboe %>%
+  dplyr::filter(opt_type == "P") %>%
+  dplyr::select(bid) %>%
+  pull(1)
+
+# Expected Move (In Dollars)
+Expected_Move_dll <- (bid_price_ATM_Calls + bid_price_ATM_Puts)*0.84
+
+# Expected Move (In %)
+Expected_Move_pct <- (bid_price_ATM_Calls + bid_price_ATM_Puts)*0.84/db_option[["data"]][["current_price"]]
 
 # Analyzing the Suprise frequency
-db_Yahoo %>%
+db_Yahoo_Earnings %>%
   dplyr::group_by(Surprise) %>%
   tally() %>%
   dplyr::mutate(pct      = (n/sum(n)),
@@ -213,7 +110,7 @@ db_Yahoo %>%
   geom_text(aes(label = pct %>% percent(accuracy = 0.01)), position = position_dodge(width = 0.9), vjust = -0.25) +
   scale_y_continuous(labels = scales::percent) +
   labs(title    = str_glue("Estimated vs Reported EPS of {ticker} - From Yahoo Finance"),
-       subtitle = str_glue("Earning Release data since {db_Yahoo$earnings_date %>% min()}"),
+       subtitle = str_glue("Earning Release data since {db_Yahoo_Earnings$earnings_date %>% min()}"),
        caption  = "By: Carlos Jimenez",
        x = "",
        y = "Percentage of time") + 
@@ -221,7 +118,7 @@ db_Yahoo %>%
         axis.ticks.y    = element_blank(),
         axis.text.y     = element_blank())
 
-db_Yahoo %>%
+db_Yahoo_Earnings %>%
   dplyr::group_by(pm_ah, Surprise) %>%
   tally() %>%
   dplyr::mutate(pct      = (n/sum(n)),
@@ -232,18 +129,18 @@ db_Yahoo %>%
   geom_text(aes(label = pct %>% percent(accuracy = 0.01)), limits = c(0, 1.5), position = position_dodge(width = 0.9), vjust = -0.25) +
   scale_y_continuous(labels = scales::percent) +
   labs(title    = str_glue("Estimated vs Reported EPS of {ticker} - From Yahoo Finance (Reported After-Hours (AH) or Pre-Market (PM)"),
-       subtitle = str_glue("Earning Release data since {db_Yahoo$earnings_date %>% min()}"),
+       subtitle = str_glue("Earning Release data since {db_Yahoo_Earnings$earnings_date %>% min()}"),
        caption  = "By: Carlos Jimenez",
        x = "",
        y = "Percentage of time") + 
   theme(legend.position = "none",
         axis.ticks.y    = element_blank(),
         axis.text.y     = element_blank()) +
-  facet_free(pm_ah ~ .)
+  facet_free(pm_ah ~ ., scales="free")
 
 # Building a DB with the performance of the Price X days before and after the Earnings Date
 DB_Earnings_Performance <- NULL
-for(Earning_date in db_Yahoo$earnings_date %>% unique()){ # Earning_date <- "2022-02-10"
+for(Earning_date in db_Yahoo_Earnings$earnings_date %>% unique()){ # Earning_date <- "2022-02-10"
   
   # Sometimes Yahoo Finance allows you to extract Future Earning Dates (we will not use those)
   if(Earning_date %>% as.Date() > (Sys.Date() - Days_Before_Earnings - Days_After_Earnings - 1)){
@@ -251,7 +148,7 @@ for(Earning_date in db_Yahoo$earnings_date %>% unique()){ # Earning_date <- "202
   }else{
     
     # Extract if it was a morning or afternoon earnings release
-    release <- db_Yahoo %>%
+    release <- db_Yahoo_Earnings %>%
       dplyr::filter(earnings_date == Earning_date) %>%
       dplyr::select(pm_ah) %>%
       pull(1)
@@ -325,7 +222,7 @@ DB_Earnings_Performance %>%
              size       = 1) +
   scale_y_continuous(labels = scales::percent) +
   labs(title    = str_glue("Behavior of the share price {Days_Before_Earnings} days before and {Days_After_Earnings} days after the earnings release."),
-       subtitle = str_glue("Historical analysis done on {ticker}. Data since {db_Yahoo$earnings_date %>% min()}."),
+       subtitle = str_glue("Historical analysis done on {ticker}. Data since {db_Yahoo_Earnings$earnings_date %>% min()}."),
        caption  = "By: Carlos Jimenez",
        x = "Days (Before and After Earnings Release)",
        y = "Accumulated Return") +
